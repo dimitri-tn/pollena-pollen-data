@@ -46,12 +46,18 @@ async function login() {
   return token;
 }
 
-async function fetchPollenData(token) {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+// Ajoute n jours à une date "YYYY-MM-DD" (en UTC, pour éviter tout effet de
+// fuseau horaire sur le calcul du jour).
+function addDays(dateStr, n) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
 
+async function fetchPollenData(token, dateStr) {
   const url = new URL(`${BASE_URL}/api/v2/data/indices/pollens`);
   url.searchParams.set('format', 'csv'); // plus compact à parser que geojson
-  url.searchParams.set('date', today);
+  url.searchParams.set('date', dateStr);
   url.searchParams.set('with_geom', 'false');
   // Pas de code_zone => toutes les zones disponibles par défaut
 
@@ -60,7 +66,7 @@ async function fetchPollenData(token) {
   });
 
   if (!res.ok) {
-    throw new Error(`Échec de la récupération : ${res.status} ${await res.text()}`);
+    throw new Error(`Échec de la récupération (${dateStr}) : ${res.status} ${await res.text()}`);
   }
 
   return res.text(); // CSV brut
@@ -165,23 +171,35 @@ async function main() {
   console.log('Connexion à Atmo Data...');
   const token = await login();
 
-  console.log('Récupération des indices pollen...');
-  const csvText = await fetchPollenData(token);
+  // Atmo France publie des prévisions à J, J+1 et J+2 : on récupère les
+  // trois jours en une seule exécution quotidienne, pour que l'application
+  // puisse afficher "aujourd'hui / demain / après-demain" sans appel
+  // supplémentaire. Chaque jour correspond à un appel séparé à l'API (celle-ci
+  // ne renvoie qu'une seule date à la fois).
+  const today = new Date().toISOString().slice(0, 10);
+  const dates = [today, addDays(today, 1), addDays(today, 2)];
 
-  console.log('Parsing et découpage par département...');
-  const rows = parseCsv(csvText);
-  console.log(`${rows.length} lignes reçues au total.`);
+  let allRows = [];
+  for (const dateStr of dates) {
+    console.log(`Récupération des indices pollen pour ${dateStr}...`);
+    const csvText = await fetchPollenData(token, dateStr);
+    const rows = parseCsv(csvText);
+    console.log(`  ${rows.length} lignes reçues pour ${dateStr}.`);
+    allRows = allRows.concat(rows);
+  }
+  console.log(`${allRows.length} lignes reçues au total (3 jours confondus).`);
 
-  if (rows.length === 0) {
+  if (allRows.length === 0) {
     // Une réponse vide est presque toujours le signe d'un problème (mauvais
     // nom de paramètre, date sans donnée publiée, format inattendu) plutôt
     // que d'une situation normale — on fait échouer le job pour qu'il soit
     // visible dans l'onglet Actions, plutôt que d'écraser silencieusement
     // les fichiers existants avec des fichiers vides.
-    throw new Error("Aucune ligne reçue de l'API : vérifier les paramètres de la requête et la réponse brute.");
+    throw new Error("Aucune ligne reçue de l'API sur les 3 jours : vérifier les paramètres de la requête et la réponse brute.");
   }
 
-  writeShards(rows);
+  console.log('Découpage par département...');
+  writeShards(allRows);
 }
 
 main().catch((err) => {

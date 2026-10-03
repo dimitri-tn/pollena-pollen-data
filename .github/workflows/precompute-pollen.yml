@@ -7,6 +7,12 @@ on:
     - cron: '0 14 * * *'
   workflow_dispatch: {} # permet de déclencher manuellement depuis l'onglet Actions
 
+# Nécessaire pour que l'étape de commit automatique puisse pousser ses
+# changements : sur de nombreux dépôts, le jeton par défaut est restreint
+# en lecture seule, ce qui ferait échouer cette étape sans ce réglage.
+permissions:
+  contents: write
+
 jobs:
   fetch-pollen:
     runs-on: ubuntu-latest
@@ -30,3 +36,14 @@ jobs:
         with:
           commit_message: 'chore: mise à jour quotidienne des indices pollen'
           file_pattern: 'data/communes/*.json'
+
+      # jsDelivr met en cache les fichiers servis via "@main" pendant 12h : sans
+      # cette étape, l'application continuerait à recevoir les anciennes données
+      # pendant ce délai après chaque mise à jour quotidienne.
+      - name: Purger le cache jsDelivr
+        run: |
+          for f in data/communes/*.json; do
+            curl -s "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/${f}" > /dev/null
+            sleep 0.2
+          done
+        shell: bash

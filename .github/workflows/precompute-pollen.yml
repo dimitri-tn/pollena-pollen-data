@@ -1,0 +1,32 @@
+name: Précalcul indices pollen
+
+on:
+  schedule:
+    # 14h UTC = 16h Paris (été) / 15h Paris (hiver) — après la fenêtre de
+    # rafraîchissement Atmo France (13h-15h heure française)
+    - cron: '0 14 * * *'
+  workflow_dispatch: {} # permet de déclencher manuellement depuis l'onglet Actions
+
+jobs:
+  fetch-pollen:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Récupérer et découper les données pollen
+        run: node scripts/fetch-pollen.js
+        env:
+          ATMO_LOGIN: ${{ secrets.ATMO_LOGIN }}
+          ATMO_PASSWORD: ${{ secrets.ATMO_PASSWORD }}
+
+      - name: Committer les fichiers générés
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore: mise à jour quotidienne des indices pollen'
+          file_pattern: 'data/communes/*.json'

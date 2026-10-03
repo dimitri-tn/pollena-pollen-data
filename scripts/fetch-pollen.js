@@ -1,10 +1,12 @@
 /**
  * Script de précalcul quotidien des indices pollen Atmo Data.
  *
- * ⚠️ CE SCRIPT EST UN SQUELETTE À AJUSTER :
- * les noms de champs dans la réponse de l'API (section "TODO" ci-dessous)
- * sont des hypothèses raisonnables, pas une certitude — ils doivent être
- * vérifiés sur un premier appel réussi avant la mise en production.
+ * Format de réponse confirmé le 3 octobre 2026 sur un appel réel à
+ * GET /api/v2/data/indices/pollens (format=csv) : une ligne par commune
+ * (~34 800 lignes), colonnes aasqa, date_maj, alerte, code_ambr, code_arm,
+ * code_aul, code_boul, code_gram, code_oliv, code_zone, conc_*, date_dif,
+ * date_ech, lib_qual, lib_zone, type_zone, pollen_resp, source, code_qual.
+ * Le champ "token" de la réponse de connexion est également confirmé.
  *
  * Nécessite Node.js 18+ (fetch natif) et les secrets d'environnement
  * ATMO_LOGIN / ATMO_PASSWORD (configurés comme secrets GitHub Actions).
@@ -35,8 +37,8 @@ async function login() {
   }
 
   const data = await res.json();
-  // TODO: confirmer le nom exact du champ contenant le token dans la
-  // réponse réelle (souvent "token", parfois "access_token" ou "jwt").
+  // Confirmé le 3 octobre 2026 : le champ s'appelle bien "token". Les deux
+  // autres noms sont gardés en repli par simple prudence, sans incidence.
   const token = data.token || data.access_token || data.jwt;
   if (!token) {
     throw new Error('Token introuvable dans la réponse de /api/login.');
@@ -65,21 +67,61 @@ async function fetchPollenData(token) {
 }
 
 /**
+ * Découpe une ligne CSV en tenant compte des champs entre guillemets
+ * (un champ "a, b" ne doit pas être coupé sur sa virgule interne), et des
+ * guillemets échappés ("" à l'intérieur d'un champ guillemeté = un seul ").
+ */
+function splitCsvLine(line, delimiter) {
+  const values = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (inQuotes) {
+      if (char === '"') {
+        if (line[i + 1] === '"') { current += '"'; i++; } // guillemet échappé
+        else inQuotes = false;
+      } else {
+        current += char;
+      }
+    } else if (char === '"') {
+      inQuotes = true;
+    } else if (char === delimiter) {
+      values.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  values.push(current);
+  return values.map((v) => v.trim());
+}
+
+/**
  * Parse le CSV renvoyé par l'API en tableau d'objets.
- * TODO: ajuster le séparateur (`,` vs `;`) et les noms de colonnes une fois
- * un exemple réel de réponse disponible.
+ * - Détecte automatiquement le séparateur (`,` ou `;`, fréquent côté
+ *   exports français) en comptant lequel est le plus présent sur l'en-tête.
+ * - Retire un éventuel BOM UTF-8 en tête de fichier (fréquent sur les
+ *   exports de données publiques françaises), qui sinon corromprait le
+ *   nom de la première colonne.
+ * - Gère les champs entre guillemets (voir splitCsvLine ci-dessus).
+ * TODO: vérifier les noms de colonnes une fois un exemple réel disponible.
  */
 function parseCsv(csvText) {
-  const [headerLine, ...lines] = csvText.trim().split('\n');
-  const headers = headerLine.split(',').map((h) => h.trim());
+  const cleaned = csvText.replace(/^\uFEFF/, ''); // retire le BOM UTF-8 s'il est présent
+  const [headerLine, ...lines] = cleaned.trim().split('\n');
+
+  const delimiter = (headerLine.match(/;/g) || []).length >= (headerLine.match(/,/g) || []).length ? ';' : ',';
+  const headers = splitCsvLine(headerLine, delimiter);
 
   return lines
     .filter((line) => line.trim().length > 0)
     .map((line) => {
-      const values = line.split(',');
+      const values = splitCsvLine(line, delimiter);
       const row = {};
       headers.forEach((header, i) => {
-        row[header] = values[i] ? values[i].trim() : null;
+        row[header] = values[i] !== undefined && values[i] !== '' ? values[i] : null;
       });
       return row;
     });
@@ -87,14 +129,17 @@ function parseCsv(csvText) {
 
 /**
  * Regroupe les lignes par département et écrit un fichier JSON par shard.
- * TODO: remplacer "code_zone" par le nom réel du champ code INSEE dans la
- * réponse si différent.
+ * Format confirmé le 3 octobre 2026 sur un appel réel : une ligne par
+ * commune (type_zone="commune"), avec "code_zone" = code INSEE commune.
+ * Chaque ligne contient directement une colonne par pollen
+ * (code_ambr, code_arm, code_aul, code_boul, code_gram, code_oliv)
+ * plutôt qu'une ligne par pollen — voir IndicePollenTab côté app.
  */
 function writeShards(rows) {
   const shards = {};
 
   for (const row of rows) {
-    const inseeCode = row.code_zone; // TODO: vérifier ce nom de champ
+    const inseeCode = row.code_zone;
     if (!inseeCode) continue;
 
     const shardKey = getDepartmentShardFromInsee(inseeCode);
@@ -106,7 +151,11 @@ function writeShards(rows) {
 
   for (const [shardKey, shardRows] of Object.entries(shards)) {
     const filePath = path.join(OUTPUT_DIR, `${shardKey}.json`);
-    fs.writeFileSync(filePath, JSON.stringify(shardRows, null, 2), 'utf-8');
+    // JSON compact (sans indentation) : fichiers plus légers à télécharger pour
+    // les utilisateurs de l'app, qui n'ont de toute façon pas besoin de lire
+    // ce fichier à l'œil. Pour déboguer à la main, repasser temporairement à
+    // JSON.stringify(shardRows, null, 2).
+    fs.writeFileSync(filePath, JSON.stringify(shardRows), 'utf-8');
   }
 
   console.log(`${Object.keys(shards).length} fichiers département écrits dans ${OUTPUT_DIR}`);
@@ -122,6 +171,15 @@ async function main() {
   console.log('Parsing et découpage par département...');
   const rows = parseCsv(csvText);
   console.log(`${rows.length} lignes reçues au total.`);
+
+  if (rows.length === 0) {
+    // Une réponse vide est presque toujours le signe d'un problème (mauvais
+    // nom de paramètre, date sans donnée publiée, format inattendu) plutôt
+    // que d'une situation normale — on fait échouer le job pour qu'il soit
+    // visible dans l'onglet Actions, plutôt que d'écraser silencieusement
+    // les fichiers existants avec des fichiers vides.
+    throw new Error("Aucune ligne reçue de l'API : vérifier les paramètres de la requête et la réponse brute.");
+  }
 
   writeShards(rows);
 }
